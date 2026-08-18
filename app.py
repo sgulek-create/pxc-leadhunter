@@ -14,13 +14,13 @@ import pandas as pd
 import streamlit as st
 
 from analyzer import AnalysisReport, FatalAnalyzerError
-from config import COMPANY_NAME, COMPANY_SHORT_NAME, ConfigError, get_settings
+from config import COMPANY_NAME, COMPANY_SHORT_NAME, ConfigError, get_settings, reload_settings
 from main import compose_search_query, run_intelligence
 from scraper import ScraperError
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
 
 st.set_page_config(
     page_title=f"{COMPANY_SHORT_NAME}-LeadHunter",
@@ -188,19 +188,32 @@ with st.sidebar:
     time_label = st.selectbox("Zaman aralığı", options=list(TIME_OPTIONS.keys()))
     fetch_pages = st.toggle("Sayfa içeriğini çek", value=True)
     st.caption("Kapalıysa yalnızca arama özetleri analiz edilir; daha hızlıdır.")
+    add_product_context = st.toggle("PXC anahtar kelimelerini ekle", value=True)
+    st.caption("Aramaya klemens, PLC, otomasyon ekler. Tek kelimede kapatın.")
     st.divider()
     if config_ready():
         st.badge("API hazır", icon=":material/check_circle:", color="green")
+        st.caption("Gerçek Gemini ve Serper anahtarları yüklendi.")
     else:
         st.badge("API anahtarı eksik", icon=":material/error:", color="red")
-        if st.button("Ayarları yeniden yükle", icon=":material/refresh:"):
-            get_settings.cache_clear()
-            st.rerun()
-        st.caption("`.env` içine OPENAI_API_KEY ve SERPER_API_KEY yazın.")
+        st.caption(
+            "Sol dosya listesinden `.env` dosyasını açın. "
+            "GEMINI_API_KEY ve SERPER_API_KEY değerlerini yapıştırıp kaydedin."
+        )
+    if st.button("Ayarları yeniden yükle", icon=":material/refresh:"):
+        try:
+            reload_settings()
+            st.success("Anahtarlar yüklendi.")
+        except ConfigError:
+            st.session_state.last_error = (
+                "Anahtarlar henüz geçerli değil. `.env` dosyasını kaydettiğinizden emin olun."
+            )
+        st.rerun()
 
 st.title("PXC-LeadHunter")
 st.caption(
-    f"{COMPANY_NAME} satış ve bayi ekipleri için müşteri adayı ve rakip istihbaratı paneli."
+    f"{COMPANY_NAME} satış ve bayi ekipleri için müşteri adayı ve rakip istihbaratı paneli. "
+    "Şirket veritabanı değil: Google’da (Serper) arar, bulunan sayfaları Gemini ile yorumlar."
 )
 
 st.pills(
@@ -228,11 +241,16 @@ if submitted:
     if not config_ready():
         st.session_state.last_error = (
             "API anahtarları eksik veya geçersiz. `.env` dosyasına "
-            "OPENAI_API_KEY ve SERPER_API_KEY ekleyip sayfayı yenileyin."
+            "GEMINI_API_KEY ve SERPER_API_KEY ekleyip sayfayı yenileyin."
         )
     else:
         try:
-            query = compose_search_query(query_input, industry, region)
+            query = compose_search_query(
+                query_input,
+                industry,
+                region,
+                add_product_context=add_product_context,
+            )
         except ValueError as exc:
             st.session_state.last_error = str(exc)
             query = ""
@@ -242,8 +260,9 @@ if submitted:
             tbs = TIME_OPTIONS.get(time_label or "Tüm zamanlar")
             try:
                 with st.status("PXC istihbaratı taranıyor…", expanded=True) as status:
-                    st.write("Web araması yapılıyor.")
-                    st.write("Sonuçlar Phoenix Contact ürünleri ve rakiplerle eşleştiriliyor.")
+                    st.write("Google’da (Serper) arama yapılıyor.")
+                    st.write(f"Sorgu: {query}")
+                    st.write("Bulunan sayfalar Gemini ile analiz ediliyor.")
                     report, frame = run_intelligence(
                         query,
                         num_results=num_results,
@@ -290,6 +309,16 @@ with st.container(horizontal=True):
     st.metric("Rakip izi", competitor_count, border=True)
 
 st.caption(f"Sorgu: {st.session_state.query_used}")
+if "hata" in frame.columns and frame["hata"].fillna("").astype(str).str.len().gt(0).any():
+    st.warning(
+        "Google sonuç buldu ama Gemini bazı kayıtları analiz edemedi. "
+        "Tablodaki Kaynak sütunu bakılan sayfalardır; Hata sütununa bakın."
+    )
+elif "sirket" in frame.columns and frame["sirket"].eq("Bilinmiyor").all():
+    st.info(
+        "Bu bir şirket rehberi değil. Google’da bu sorguyla çıkan sayfalar listelenir. "
+        "Daha iyi sonuç için somut bir ifade kullanın: sektör + yatırım/ihale + bölge."
+    )
 
 filter_bar = st.container(border=True)
 with filter_bar:
