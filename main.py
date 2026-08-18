@@ -88,7 +88,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def compose_search_query(query: str, industry: str = "", region: str = "") -> str:
+def compose_search_query(
+    query: str,
+    industry: str = "",
+    region: str = "",
+    *,
+    add_product_context: bool = True,
+) -> str:
     """CLI ve Streamlit arayüzünün ortak sorgu birleştiricisi."""
     parts = [part.strip() for part in (query, industry, region) if part and part.strip()]
     if not parts:
@@ -97,7 +103,11 @@ def compose_search_query(query: str, industry: str = "", region: str = "") -> st
     context = "endüstriyel otomasyon elektrik bağlantı klemens PLC"
     joined = " ".join(parts)
     lowered = joined.lower()
-    if "phoenix contact" not in lowered and "klemens" not in lowered:
+    if (
+        add_product_context
+        and "phoenix contact" not in lowered
+        and "klemens" not in lowered
+    ):
         joined = f"{joined} {context}"
     return " ".join(joined.split())
 
@@ -124,7 +134,7 @@ def configure_logging(verbose: bool) -> None:
         datefmt="%H:%M:%S",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("google").setLevel(logging.WARNING)
 
 
 def report_to_frame(report: AnalysisReport) -> pd.DataFrame:
@@ -164,6 +174,7 @@ def run_intelligence(
         raise ValueError(f"Geçersiz odak: {focus}")
     num_results = max(1, min(int(num_results), 20))
 
+    get_settings.cache_clear()
     settings = get_settings()
     scraper = WebScraper(settings)
     analyzer = LeadAnalyzer(settings)

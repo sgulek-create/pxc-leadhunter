@@ -1,4 +1,4 @@
-"""Arama sonuçlarını OpenAI ile pazar istihbaratına dönüştürür.
+"""Arama sonuçlarını Google Gemini ile pazar istihbaratına dönüştürür.
 
 Phoenix Contact ürün aileleri ve rakip faaliyetleriyle eşleştirme yapar.
 """
@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
-from openai import APIError, AuthenticationError, OpenAI, RateLimitError
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 from pydantic import BaseModel, Field, ValidationError
 
 from config import COMPANY_NAME, COMPANY_SHORT_NAME, Settings
@@ -115,7 +117,7 @@ class AnalysisReport(BaseModel):
 
 
 class AnalyzerError(RuntimeError):
-    """OpenAI analiz hatası."""
+    """Gemini analiz hatası."""
 
     fatal: bool = False
 
@@ -139,12 +141,75 @@ def _result_payload(result: SearchResult) -> dict[str, Any]:
     }
 
 
+def _extract_text_payload(raw: str, *, json_mode: bool) -> str:
+    cleaned = (raw or "").strip()
+    if not json_mode:
+        return cleaned
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
 class LeadAnalyzer:
-    """OpenAI ile müşteri adayı ve pazar istihbaratı üretir."""
+    """Google Gemini ile müşteri adayı ve pazar istihbaratı üretir."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = OpenAI(api_key=settings.openai_api_key)
+        genai.configure(api_key=settings.gemini_api_key)
+        self.model = genai.GenerativeModel(
+            model_name=settings.gemini_model,
+            system_instruction=(
+                f"Sen {COMPANY_NAME} ({COMPANY_SHORT_NAME}) için çalışan kıdemli bir "
+                "pazar istihbaratı analistisin. PXC her zaman Phoenix Contact anlamındadır."
+            ),
+        )
+
+    def _generate(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        json_mode: bool,
+        extra_system: str = "",
+    ) -> str:
+        generation_config: dict[str, Any] = {"temperature": temperature}
+        if json_mode:
+            generation_config["response_mime_type"] = "application/json"
+
+        contents = prompt if not extra_system else f"{extra_system.strip()}\n\n{prompt}"
+        try:
+            response = self.model.generate_content(
+                contents,
+                generation_config=generation_config,
+            )
+        except (google_exceptions.Unauthenticated, google_exceptions.PermissionDenied) as exc:
+            raise FatalAnalyzerError(
+                "Gemini kimlik doğrulaması başarısız. GEMINI_API_KEY değerini kontrol edin."
+            ) from exc
+        except google_exceptions.ResourceExhausted as exc:
+            raise FatalAnalyzerError(
+                "Gemini kota/rate-limit aşıldı. Bir süre sonra tekrar deneyin."
+            ) from exc
+        except google_exceptions.NotFound as exc:
+            raise FatalAnalyzerError(
+                f"Gemini modeli bulunamadı ({self.settings.gemini_model}). "
+                "`.env` içinde GEMINI_MODEL=gemini-3.6-flash kullanın."
+            ) from exc
+        except google_exceptions.InvalidArgument as exc:
+            raise FatalAnalyzerError(
+                f"Gemini model/ayar hatası ({self.settings.gemini_model}): {exc}"
+            ) from exc
+        except google_exceptions.GoogleAPIError as exc:
+            raise AnalyzerError(f"Gemini API hatası: {exc}") from exc
+        except Exception as exc:
+            raise AnalyzerError(f"Analiz isteği gönderilemedi: {exc}") from exc
+
+        try:
+            text = (response.text or "").strip()
+        except ValueError:
+            text = ""
+        return _extract_text_payload(text, json_mode=json_mode)
 
     def analyze_result(self, result: SearchResult, *, focus: str = "all") -> LeadInsight:
         """Tek bir arama sonucunu yapılandırılmış içgörüye çevirir."""
@@ -191,30 +256,12 @@ Odak: {focus}
             + json.dumps(_result_payload(result), ensure_ascii=False, indent=2)
         )
 
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.settings.openai_model,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-        except AuthenticationError as exc:
-            raise FatalAnalyzerError(
-                "OpenAI kimlik doğrulaması başarısız. OPENAI_API_KEY değerini kontrol edin."
-            ) from exc
-        except RateLimitError as exc:
-            raise FatalAnalyzerError(
-                "OpenAI kota/rate-limit aşıldı. Bir süre sonra tekrar deneyin."
-            ) from exc
-        except APIError as exc:
-            raise AnalyzerError(f"OpenAI API hatası: {exc}") from exc
-        except Exception as exc:  # ağ veya SDK beklenmeyen hataları
-            raise AnalyzerError(f"Analiz isteği gönderilemedi: {exc}") from exc
-
-        content = (completion.choices[0].message.content or "").strip()
+        content = self._generate(
+            user_prompt,
+            temperature=0.2,
+            json_mode=True,
+            extra_system=system_prompt,
+        )
         if not content:
             return LeadInsight(
                 source_url=result.url,
@@ -265,18 +312,12 @@ Odak: {focus}
             f"Veri:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
         )
         try:
-            completion = self.client.chat.completions.create(
-                model=self.settings.openai_model,
+            return self._generate(
+                prompt,
                 temperature=0.3,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Sen Phoenix Contact pazar istihbaratı analistisin. Kısa ve eyleme dönük yaz.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+                json_mode=False,
+                extra_system="Sen Phoenix Contact pazar istihbaratı analistisin. Kısa ve eyleme dönük yaz.",
             )
-            return (completion.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("Yönetici özeti üretilemedi: %s", exc)
             top = viable[0]
@@ -315,7 +356,7 @@ Odak: {focus}
                         source_url=result.url,
                         title=result.title,
                         opportunity_summary="Bu kayıt analiz edilemedi.",
-                        error="analyzer_error",
+                        error=str(exc)[:400],
                     )
                 )
 
